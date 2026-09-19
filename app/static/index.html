@@ -29,13 +29,22 @@
     </section>
   </main>
 
+  <!-- 观察链接失效 -->
+  <main id="view-gone" class="landing-msg hidden">
+    <section class="panel">
+      <h2>观察链接已失效</h2>
+      <p id="gone-message" class="hint">该观察链接已过期或已被主持人撤销，请向主持人重新索取。</p>
+    </section>
+  </main>
+
   <!-- 房间视图 -->
   <main id="view-room" class="room hidden">
     <section class="room-head panel">
       <div>
         <div class="room-name" id="room-name"></div>
-        <div class="room-code">加入码 <button id="room-code" class="code-chip" title="点击复制"></button></div>
+        <div class="room-code" id="room-code-row">加入码 <button id="room-code" class="code-chip" title="点击复制"></button></div>
         <div id="player-group" class="player-group hidden"></div>
+        <div id="observer-meta" class="observer-meta hidden"></div>
       </div>
       <div class="clock-box">
         <div id="clock" class="clock">00:00:00</div>
@@ -75,6 +84,19 @@
         <button type="submit" class="primary">添加卡片</button>
         <span id="card-form-hint" class="hint"></span>
       </form>
+
+      <h3>限时观察席</h3>
+      <p class="hint">选择 1～3 个参与组并设置 5～120 分钟有效期，生成只读观察链接。
+        观察者只能看到<strong>已揭示</strong>的全员卡与所选组卡片，看不到未揭示卡、房间码、加入码与回执明细，也无法控制演练；主持人可随时撤销。</p>
+      <div id="share-groups" class="share-groups"></div>
+      <div class="share-form-row">
+        <label class="share-ttl">有效期
+          <input id="share-ttl" type="number" min="5" max="120" step="1" value="30">
+          分钟（5～120）
+        </label>
+        <button id="btn-share-create" class="primary">生成观察链接</button>
+      </div>
+      <ul id="share-list" class="share-list"></ul>
     </section>
 
     <!-- 卡片列表 -->

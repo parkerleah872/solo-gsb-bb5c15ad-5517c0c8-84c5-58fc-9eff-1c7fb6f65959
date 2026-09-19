@@ -7,24 +7,30 @@
  * 2. 服务端先推权威快照（snapshot）——全量替换本地状态，水位 = snapshot.last_event_id；
  * 3. 之后只应用 id > 水位的增量事件，旧事件一律丢弃，状态绝不回退。
  *
- * 分组定向：主持人用房间码连接（全量视野），参与者用组加入码连接；
- * 服务端已按组过滤快照与事件，未命中本组的卡片不会到达本端。
+ * 三种视野：主持人用房间码连接（全量），参与者用组加入码连接，观察者用限时观察
+ * 链接（/ws/observe/{token}）连接。服务端已按视野过滤快照与事件；观察者只读，
+ * 仅收已揭示的全员卡 + 所选组卡，服务端撤销/到期会主动断开且重连被拒。
  */
 
 const $ = (sel) => document.querySelector(sel);
 
 const state = {
-  code: null,      // 主持人 = 房间码；参与者 = 组加入码
-  role: null,      // 'host' | 'player'
+  code: null,      // 主持人 = 房间码；参与者 = 组加入码；观察者 = 'ob:' + token
+  token: null,     // 观察者凭证
+  role: null,      // 'host' | 'player' | 'observer'
   roomName: '',
   status: 'idle',
   cards: [],
-  groups: [],      // 主持人：全部参与组；参与者：仅本组
+  groups: [],      // 主持人：全部参与组；参与者：仅本组；观察者：所选组（无加入码）
   groupId: null,   // 参与者本组 id（主持人为 null）
+  observerGroupIds: [],  // 观察者所选组 id
+  observerExpiresAt: null, // 观察者到期时间（墙钟 ms）
+  shares: [],      // 主持人：限时观察席列表
   lastEventId: 0,
   clock: { status: 'idle', elapsedMs: 0, syncedAt: performance.now() },
   ws: null,
   reconnectDelay: 1000,
+  closed: false,   // 观察者凭证失效等终局：停止自动重连
 };
 
 const STATUS_TEXT = { idle: '待机', running: '进行中', paused: '已暂停' };
@@ -34,13 +40,28 @@ const STATUS_TEXT = { idle: '待机', running: '进行中', paused: '已暂停' 
 function showLanding() {
   $('#view-landing').classList.remove('hidden');
   $('#view-room').classList.add('hidden');
+  $('#view-gone').classList.add('hidden');
+}
+
+function showGone(message) {
+  if (state.ws) { state.ws.onclose = null; state.ws.close(); }
+  state.code = null;
+  state.token = null;
+  if (message) $('#gone-message').textContent = message;
+  $('#view-landing').classList.add('hidden');
+  $('#view-room').classList.add('hidden');
+  $('#view-gone').classList.remove('hidden');
+  history.replaceState(null, '', location.pathname);
 }
 
 function showRoom() {
   $('#view-landing').classList.add('hidden');
+  $('#view-gone').classList.add('hidden');
   $('#view-room').classList.remove('hidden');
   $('#host-console').classList.toggle('hidden', state.role !== 'host');
-  $('#cards-title').textContent = state.role === 'host' ? '注入卡片（全部）' : '已揭示的情景注入';
+  if (state.role === 'host') $('#cards-title').textContent = '注入卡片（全部）';
+  else if (state.role === 'player') $('#cards-title').textContent = '已揭示的情景注入';
+  else $('#cards-title').textContent = '观察中的情景注入（仅已揭示）';
 }
 
 /* ---------------------------------------------------------- 渲染 */
@@ -64,12 +85,22 @@ function renderMeta() {
   const st = $('#status');
   st.textContent = STATUS_TEXT[state.status] || state.status;
   st.className = 'status' + (state.status === 'running' ? ' running' : state.status === 'paused' ? ' paused' : '');
+  // 房间码是主持人凭证：仅主持人界面可见
+  $('#room-code-row').classList.toggle('hidden', state.role !== 'host');
   const pg = $('#player-group');
   if (state.role === 'player' && state.groupId != null) {
     pg.textContent = `参与组：${groupName(state.groupId)}`;
     pg.classList.remove('hidden');
   } else {
     pg.classList.add('hidden');
+  }
+  const om = $('#observer-meta');
+  if (state.role === 'observer') {
+    const names = state.observerGroupIds.map(groupName).join('、') || '全员';
+    om.innerHTML = `<span class="observer-tag">限时观察席 · 只读</span> 可见范围：全员 + ${names}`;
+    om.classList.remove('hidden');
+  } else {
+    om.classList.add('hidden');
   }
   renderControls();
 }
@@ -86,7 +117,7 @@ function renderControls() {
   $('#card-form-hint').textContent = editing ? '' : '时钟运行中，暂停后才能编辑卡片';
 }
 
-/* 主持人：参与组列表 + 卡片目标下拉 */
+/* 主持人：参与组列表 + 卡片目标下拉 + 观察席勾选 */
 function renderGroups() {
   if (state.role !== 'host') return;
   $('#group-count').textContent = state.groups.length;
@@ -153,6 +184,103 @@ function renderGroups() {
     sel.appendChild(opt);
   }
   sel.value = [...sel.options].some((o) => o.value === cur) ? cur : '';
+
+  renderShareCheckboxes();
+}
+
+/* 观察席创建区：勾选 1～3 个参与组（保留已有勾选） */
+function renderShareCheckboxes() {
+  const box = $('#share-groups');
+  const checked = new Set(
+    [...box.querySelectorAll('input[type=checkbox]:checked')].map((el) => parseInt(el.value, 10)),
+  );
+  box.innerHTML = '';
+  for (const g of state.groups) {
+    const label = document.createElement('label');
+    label.className = 'share-checkbox';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = String(g.id);
+    cb.checked = checked.has(g.id);
+    cb.onchange = () => {
+      if (box.querySelectorAll('input:checked').length > 3) {
+        cb.checked = false;
+        showError(new Error('最多选择 3 个参与组'));
+      }
+    };
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(g.name));
+    box.appendChild(label);
+  }
+  $('#btn-share-create').disabled = state.groups.length === 0;
+}
+
+function shareLink(token) {
+  return `${location.origin}${location.pathname}#/observer/${token}`;
+}
+
+function fmtDateTime(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/* 主持人：限时观察席列表（有效 / 已过期 / 已撤销，可复制、可撤销） */
+function renderShares(nowMs) {
+  if (state.role !== 'host') return;
+  const list = $('#share-list');
+  list.innerHTML = '';
+  const now = nowMs || Date.now();
+  for (const s of state.shares) {
+    const active = !s.revoked && s.expires_at_ms > now;
+    const statusText = s.revoked ? '已撤销' : active ? '有效' : '已过期';
+    const li = document.createElement('li');
+    li.className = 'share-item share-' + (s.revoked ? 'revoked' : active ? 'active' : 'expired');
+
+    const head = document.createElement('div');
+    head.className = 'share-head';
+    const names = s.group_ids.map(groupName).join('、');
+    const left = document.createElement('span');
+    left.className = 'share-title';
+    left.textContent = `全员 + ${names} · 至 ${fmtDateTime(s.expires_at_ms)}`;
+    head.appendChild(left);
+    const badge = document.createElement('span');
+    badge.className = 'share-badge';
+    badge.textContent = statusText;
+    head.appendChild(badge);
+    li.appendChild(head);
+
+    const link = document.createElement('div');
+    link.className = 'share-link';
+    link.textContent = shareLink(s.token);
+    li.appendChild(link);
+
+    if (active) {
+      const ops = document.createElement('div');
+      ops.className = 'share-ops';
+      const copy = document.createElement('button');
+      copy.className = 'group-op';
+      copy.textContent = '复制链接';
+      copy.onclick = () => {
+        navigator.clipboard?.writeText(shareLink(s.token));
+        copy.textContent = '已复制';
+        setTimeout(() => { copy.textContent = '复制链接'; }, 1200);
+      };
+      ops.appendChild(copy);
+      const revoke = document.createElement('button');
+      revoke.className = 'group-op group-del';
+      revoke.textContent = '撤销';
+      revoke.onclick = async () => {
+        if (!confirm('撤销该观察链接？在线观察者将被立即断开，且链接永久失效。')) return;
+        try {
+          await api('DELETE', `/api/rooms/${state.code}/observer-shares/${s.id}`);
+        } catch (err) { showError(err); }
+      };
+      ops.appendChild(revoke);
+      li.appendChild(ops);
+    }
+    list.appendChild(li);
+  }
 }
 
 function sortedCards() {
@@ -167,6 +295,8 @@ function renderCards() {
   $('#cards-empty').classList.toggle('hidden', visible.length > 0);
   if (state.role === 'player') {
     $('#cards-empty').textContent = all.some((c) => c.revealed) ? '' : '等待主持人注入情景…';
+  } else if (state.role === 'observer') {
+    $('#cards-empty').textContent = '暂无可观察的已揭示卡片…';
   } else {
     $('#cards-empty').textContent = '暂无卡片，请在上方添加';
   }
@@ -273,6 +403,7 @@ function renderAll() {
   renderMeta();
   renderGroups();
   renderCards();
+  renderShares();
 }
 
 /* 本地时钟渲染：以快照/事件同步点为基准，running 时本地外推，暂停即冻结 */
@@ -281,6 +412,17 @@ setInterval(() => {
   const c = state.clock;
   const elapsed = c.status === 'running' ? c.elapsedMs + (performance.now() - c.syncedAt) : c.elapsedMs;
   $('#clock').textContent = fmt(elapsed);
+  if (state.role === 'observer' && state.observerExpiresAt) {
+    const remain = state.observerExpiresAt - Date.now();
+    const om = $('#observer-meta');
+    if (remain <= 0) {
+      showGone('观察链接已过期。');
+      return;
+    }
+    const tag = om.querySelector('.observer-tag');
+    if (tag) tag.textContent = `限时观察席 · 只读 · 剩余 ${fmt(Math.max(0, remain))}`;
+  }
+  if (state.role === 'host') renderShares(Date.now()); // 驱动「有效→已过期」状态翻转
 }, 200);
 
 function syncClock(status, elapsedMs) {
@@ -294,7 +436,20 @@ function applySnapshot(msg) {
   state.roomName = msg.room.name;
   state.cards = msg.cards;
   state.groups = msg.groups || [];
-  state.groupId = msg.scope && msg.scope.role === 'player' ? msg.scope.group_id : null;
+  if (msg.scope && msg.scope.role === 'player') {
+    state.groupId = msg.scope.group_id;
+    state.observerGroupIds = [];
+    state.observerExpiresAt = null;
+  } else if (msg.scope && msg.scope.role === 'observer') {
+    state.groupId = null;
+    state.observerGroupIds = msg.scope.group_ids || [];
+    state.observerExpiresAt = msg.scope.expires_at_ms || null;
+  } else {
+    state.groupId = null;
+    state.observerGroupIds = [];
+    state.observerExpiresAt = null;
+    state.shares = msg.observer_shares || [];
+  }
   state.lastEventId = msg.last_event_id; // 权威水位
   syncClock(msg.room.status, msg.room.elapsed_ms);
   renderAll();
@@ -333,6 +488,15 @@ function applyEvent(msg) {
       }
       break;
     }
+    case 'observer_share_added':
+      if (state.role === 'host' && !state.shares.some((s) => s.id === p.id)) state.shares.push(p);
+      break;
+    case 'observer_share_revoked':
+      if (state.role === 'host') {
+        const s = state.shares.find((x) => x.id === p.id);
+        if (s) s.revoked = true;
+      }
+      break;
     case 'group_added':
       if (!state.groups.some((g) => g.id === p.id)) state.groups.push(p);
       // 新组自动成为所有全员卡片的待回执方
@@ -366,6 +530,7 @@ function applyEvent(msg) {
         if (c.receipts) c.receipts.acked = []; // 回执随揭示一并收回
         if ('my_receipt' in c) c.my_receipt = false;
       });
+      if (state.role === 'observer') state.cards = []; // 观察者视野里未揭示卡应全部消失
       syncClock('idle', 0);
       break;
   }
@@ -392,9 +557,16 @@ function setConn(up) {
   el.className = 'conn ' + (up ? 'conn-up' : 'conn-down');
 }
 
-function connect() {
+function wsPath() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/${state.code}?last_event_id=${state.lastEventId}`);
+  if (state.role === 'observer') {
+    return `${proto}://${location.host}/ws/observe/${state.token}?last_event_id=${state.lastEventId}`;
+  }
+  return `${proto}://${location.host}/ws/${state.code}?last_event_id=${state.lastEventId}`;
+}
+
+function connect() {
+  const ws = new WebSocket(wsPath());
   state.ws = ws;
 
   ws.onopen = () => { state.reconnectDelay = 1000; setConn(true); };
@@ -402,11 +574,25 @@ function connect() {
     const msg = JSON.parse(e.data);
     if (msg.kind === 'snapshot') applySnapshot(msg);
     else if (msg.kind === 'event') applyEvent(msg);
-    else if (msg.kind === 'error') { alert(msg.message); leaveRoom(); }
+    else if (msg.kind === 'error') {
+      if (state.role === 'observer') {
+        state.closed = true;
+        showGone(msg.message || '观察链接已失效。');
+      } else {
+        alert(msg.message);
+        leaveRoom();
+      }
+    }
   };
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     setConn(false);
-    if (!state.code) return;
+    if (!state.code || state.closed) return;
+    // 观察者被服务端以 4404 踢断（到期/撤销）：终局，不重连
+    if (state.role === 'observer' && ev.code === 4404) {
+      state.closed = true;
+      showGone('观察链接已过期或已被主持人撤销。');
+      return;
+    }
     setTimeout(connect, state.reconnectDelay);
     state.reconnectDelay = Math.min(state.reconnectDelay * 2, 5000);
   };
@@ -437,15 +623,24 @@ function showError(err) {
 
 /* ---------------------------------------------------------- 流程 */
 
-function enterRoom(code, role) {
+function enterRoom(code, role, token) {
   state.code = code;
   state.role = role;
+  state.token = token || null;
+  state.closed = false;
   state.lastEventId = 0;
   state.cards = [];
   state.groups = [];
+  state.shares = [];
   state.groupId = null;
-  location.hash = `#/${role}/${code}`;
-  localStorage.setItem(`inject-role-${code}`, role);
+  state.observerGroupIds = [];
+  state.observerExpiresAt = null;
+  if (role === 'observer') {
+    location.hash = `#/observer/${token}`;
+  } else {
+    location.hash = `#/${role}/${code}`;
+    localStorage.setItem(`inject-role-${code}`, role);
+  }
   showRoom();
   renderAll();
   connect();
@@ -454,6 +649,8 @@ function enterRoom(code, role) {
 function leaveRoom() {
   if (state.ws) { state.ws.onclose = null; state.ws.close(); }
   state.code = null;
+  state.token = null;
+  state.closed = false;
   location.hash = '';
   showLanding();
 }
@@ -474,6 +671,17 @@ $('#btn-join').onclick = async () => {
     enterRoom(code, 'player');
   } catch (err) { showError(new Error('加入码无效，请向主持人确认组加入码')); }
 };
+
+/* 观察者凭限时链接进入：先经 REST 校验凭证（失效则停留在此并提示） */
+async function enterObserver(token) {
+  try {
+    await api('GET', `/api/observe/${token}`);
+  } catch (err) {
+    showGone(err.message || '观察链接无效，请向主持人确认链接是否正确。');
+    return;
+  }
+  enterRoom('ob:' + token, 'observer', token);
+}
 
 $('#room-code').onclick = () => {
   navigator.clipboard?.writeText(state.code);
@@ -514,9 +722,29 @@ $('#card-form').onsubmit = async (e) => {
   } catch (err) { showError(err); }
 };
 
+/* 主持人生成限时观察链接 */
+$('#btn-share-create').onclick = async () => {
+  const groupIds = [...$('#share-groups input:checked')].map((el) => parseInt(el.value, 10));
+  const ttl = parseInt($('#share-ttl').value, 10);
+  if (groupIds.length < 1 || groupIds.length > 3) {
+    showError(new Error('请选择 1～3 个参与组'));
+    return;
+  }
+  if (!Number.isInteger(ttl) || ttl < 5 || ttl > 120) {
+    showError(new Error('有效期需为 5～120 分钟之间的整数'));
+    return;
+  }
+  try {
+    await api('POST', `/api/rooms/${state.code}/observer-shares`,
+      { group_ids: groupIds, ttl_minutes: ttl });
+  } catch (err) { showError(err); }
+};
+
 /* 刷新恢复：根据 hash 与本地角色记录重进房间（走完整的快照+增量协议） */
 (function boot() {
-  const m = location.hash.match(/^#\/(host|player)\/([A-Z0-9]{6})$/);
-  if (m) enterRoom(m[2], m[1]);
+  const hash = location.hash;
+  let m = hash.match(/^#\/(host|player)\/([A-Za-z0-9]{6})$/);
+  if (m) enterRoom(m[2].toUpperCase(), m[1]);
+  else if ((m = hash.match(/^#\/observer\/([A-Za-z0-9_-]+)$/))) enterObserver(m[1]);
   else showLanding();
 })();
