@@ -6,6 +6,10 @@
 - 后台 tick：按 (trigger_seconds, seq) 稳定次序揭示到期卡片
 - 卡片回执：参与者对已揭示的本组可见卡片标记/撤销「已收到」，
   同一参与组仅保留一条回执；主持人实时看到每组回执/未回执汇总
+- 限时观察席分享：主持人选择 1~3 个参与组并设置 5~120 分钟有效期，
+  生成可撤销的随机观察链接；观察者只读，仅能收到已揭示的全员卡片与
+  所选组卡片，拿不到未揭示卡、房间码、组加入码、回执明细与控制能力；
+  到期或撤销时立即断开在线观察者，凭证此后一律失效
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -22,6 +26,7 @@ import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import NamedTuple
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -134,12 +139,90 @@ def resolve_code(code: str) -> tuple[sqlite3.Row | None, int | None]:
     return None, None
 
 
-def build_snapshot(room: sqlite3.Row, scope: int | None) -> dict:
-    """权威全量状态，按视野过滤：主持人拿全部；参与者只拿全员卡片与本组卡片。
+# ---------------------------------------------------------------- 观察席分享
+
+# 视野（scope）三种取值：None = 主持人（全量）；int = 参与组 id（玩家）；
+# ObserverScope = 观察者（只读、仅已揭示、限定所选参与组）。
+class ObserverScope(NamedTuple):
+    token: str                     # 观察凭证（撤销/到期时按它断开连接）
+    group_ids: frozenset[int]      # 主持人选定的 1~3 个参与组
+
+
+def share_active(share: sqlite3.Row) -> bool:
+    """凭证当前是否有效：未撤销且未到期。"""
+    return not share["revoked"] and share["expires_at"] > time.time()
+
+
+def observer_scope_from(share: sqlite3.Row) -> ObserverScope:
+    return ObserverScope(token=share["token"],
+                         group_ids=frozenset(json.loads(share["group_ids"])))
+
+
+def get_active_share_or_410(token: str) -> sqlite3.Row:
+    """解析观察凭证：不存在 404；已撤销/已到期 410（刷新重连均不可恢复）。"""
+    share = db.execute(
+        "SELECT * FROM observer_shares WHERE token = ?", (token,)
+    ).fetchone()
+    if share is None:
+        raise HTTPException(status_code=404, detail="share not found")
+    if not share_active(share):
+        raise HTTPException(status_code=410, detail="share expired or revoked")
+    return share
+
+
+def share_public(share: sqlite3.Row) -> dict:
+    """主持人视角的分享序列化。含观察凭证，只随主持人快照/事件下发，绝不给玩家与观察者。"""
+    gids: list[int] = json.loads(share["group_ids"])
+    names: dict[int, str] = {}
+    if gids:
+        marks = ",".join("?" * len(gids))
+        for row in db.execute(f"SELECT id, name FROM groups WHERE id IN ({marks})", gids):
+            names[row["id"]] = row["name"]
+    revoked = bool(share["revoked"])
+    expired = share["expires_at"] <= time.time()
+    return {
+        "token": share["token"],
+        "group_ids": gids,
+        "group_names": [names.get(gid, f"#{gid}") for gid in gids],
+        "minutes": max(1, round((share["expires_at"] - share["created_at"]) / 60)),
+        "created_at": share["created_at"],
+        "expires_at": share["expires_at"],
+        "status": "revoked" if revoked else ("expired" if expired else "active"),
+    }
+
+
+def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict:
+    """权威全量状态，按视野过滤：主持人拿全部；参与者只拿全员卡片与本组卡片；
+    观察者只拿已揭示的全员卡片与所选组卡片（只读，无回执数据）。
 
     回执数据同样按视野下发：主持人拿到每张卡的 expected/acked 汇总，
-    参与者只拿到本组是否已回执（my_receipt），看不到他组的回执情况。
+    参与者只拿到本组是否已回执（my_receipt），观察者完全拿不到回执。
     """
+    if isinstance(scope, ObserverScope):
+        gids = sorted(scope.group_ids)
+        marks = ",".join("?" * len(gids))
+        cards = db.execute(
+            f"""SELECT * FROM cards
+                WHERE room_id = ? AND revealed = 1
+                  AND (group_id IS NULL OR group_id IN ({marks}))
+                ORDER BY trigger_seconds, seq""",
+            (room["id"], *gids),
+        ).fetchall()
+        groups = db.execute(
+            f"SELECT * FROM groups WHERE id IN ({marks}) ORDER BY id", gids
+        ).fetchall()
+        last_id = db.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM events WHERE room_id = ?", (room["id"],)
+        ).fetchone()["m"]
+        return {
+            "kind": "snapshot",
+            "last_event_id": last_id,
+            "server_now_ms": now_ms(),
+            "scope": {"role": "observer", "group_ids": gids},
+            "room": room_public(room, include_code=False),       # 观察者拿不到房间码
+            "groups": [{"id": g["id"], "name": g["name"]} for g in groups],  # 不含组加入码
+            "cards": [card_public(c) for c in cards],            # 仅已揭示；无回执字段
+        }
     if scope is None:
         cards = db.execute(
             "SELECT * FROM cards WHERE room_id = ? ORDER BY trigger_seconds, seq",
@@ -159,7 +242,7 @@ def build_snapshot(room: sqlite3.Row, scope: int | None) -> dict:
     last_id = db.execute(
         "SELECT COALESCE(MAX(id), 0) AS m FROM events WHERE room_id = ?", (room["id"],)
     ).fetchone()["m"]
-    return {
+    snapshot = {
         "kind": "snapshot",
         "last_event_id": last_id,
         "server_now_ms": now_ms(),
@@ -168,6 +251,13 @@ def build_snapshot(room: sqlite3.Row, scope: int | None) -> dict:
         "groups": [group_public(g) for g in groups],
         "cards": snapshot_cards(room, cards, groups, scope),
     }
+    if scope is None:
+        # 主持人快照附带全部观察分享（有效/失效），供控制台列出与管理
+        shares = db.execute(
+            "SELECT * FROM observer_shares WHERE room_id = ? ORDER BY id DESC", (room["id"],)
+        ).fetchall()
+        snapshot["shares"] = [share_public(s) for s in shares]
+    return snapshot
 
 
 def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
@@ -210,10 +300,22 @@ def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
 
 # ---------------------------------------------------------------- 广播
 
-def event_visible(scope: int | None, type_: str, payload: dict) -> bool:
-    """事件是否应投递给该视野。主持人全收；参与者只收全员/本组卡片事件与房间级事件。"""
+def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) -> bool:
+    """事件是否应投递给该视野。主持人全收；参与者只收全员/本组卡片事件与房间级事件；
+    观察者只收已揭示卡片揭示/移除与房间级事件。"""
     if scope is None:
         return True
+    if type_.startswith("share_"):
+        return False  # 分享事件含观察凭证，仅主持人可见
+    if isinstance(scope, ObserverScope):
+        if type_ in ("card_revealed", "card_removed"):
+            gid = payload.get("group_id")
+            return gid is None or gid in scope.group_ids
+        if type_ in ("group_renamed", "group_removed"):
+            return payload.get("id") in scope.group_ids
+        if type_ in ("card_added", "group_added", "receipt_updated"):
+            return False  # 未揭示卡、组加入码、回执明细一律不下发
+        return True  # clock / reset 等房间级事件
     if type_ in ("card_added", "card_revealed", "card_removed"):
         gid = payload.get("group_id")
         return gid is None or gid == scope
@@ -227,12 +329,13 @@ def event_visible(scope: int | None, type_: str, payload: dict) -> bool:
 
 
 class Hub:
-    """按房间维护连接及其视野（None=主持人，否则为组 id），广播时按视野过滤。"""
+    """按房间维护连接及其视野（None=主持人，int=参与组，ObserverScope=观察者），
+    广播时按视野过滤。"""
 
     def __init__(self) -> None:
-        self._rooms: dict[str, dict[WebSocket, int | None]] = {}
+        self._rooms: dict[str, dict[WebSocket, int | None | ObserverScope]] = {}
 
-    def add(self, code: str, ws: WebSocket, scope: int | None) -> None:
+    def add(self, code: str, ws: WebSocket, scope: int | None | ObserverScope) -> None:
         self._rooms.setdefault(code, {})[ws] = scope
 
     def discard(self, code: str, ws: WebSocket) -> None:
@@ -265,6 +368,18 @@ class Hub:
                 pass
             self.discard(code, ws)
 
+    async def close_observer(self, code: str, token: str, message: dict) -> None:
+        """分享撤销/到期后，主动断开该观察凭证的所有连接。"""
+        for ws, ws_scope in list(self._rooms.get(code, {}).items()):
+            if not (isinstance(ws_scope, ObserverScope) and ws_scope.token == token):
+                continue
+            try:
+                await ws.send_json(message)
+                await ws.close(code=4403)
+            except Exception:
+                pass
+            self.discard(code, ws)
+
 
 hub = Hub()
 
@@ -286,6 +401,28 @@ async def publish(code: str, room_id: int, type_: str, payload: dict) -> None:
 
 
 # ---------------------------------------------------------------- 时钟 tick
+
+async def expire_due_shares() -> None:
+    """把刚到期的观察分享标记失效：广播 share_expired 给主持人、断开在线观察者。
+
+    须在 state_lock 下调用。expired_notified 持久化，保证重启后不会重复广播；
+    到期判定以 expires_at 为准，凭证此后 REST/WS 一律 410，刷新重连不可恢复。
+    """
+    due = db.execute(
+        """SELECT s.id, s.room_id, s.token, r.code AS room_code
+           FROM observer_shares s JOIN rooms r ON r.id = s.room_id
+           WHERE s.expires_at <= ? AND s.revoked = 0 AND s.expired_notified = 0""",
+        (time.time(),),
+    ).fetchall()
+    for share in due:
+        db.execute("UPDATE observer_shares SET expired_notified = 1 WHERE id = ?", (share["id"],))
+        db.commit()
+        await publish(share["room_code"], share["room_id"], "share_expired",
+                      {"token": share["token"]})
+        await hub.close_observer(share["room_code"], share["token"],
+                                 {"kind": "error", "message": "观察链接已到期"})
+        log.info("share %s expired, observers disconnected", share["token"][:8])
+
 
 async def ticker_loop() -> None:
     """周期性扫描 running 房间，按 (trigger_seconds, seq) 稳定揭示到期卡片。"""
@@ -311,6 +448,7 @@ async def ticker_loop() -> None:
                         fresh = db.execute("SELECT * FROM cards WHERE id = ?", (card["id"],)).fetchone()
                         await publish(room["code"], room["id"], "card_revealed", card_public(fresh))
                         log.info("room %s revealed card #%s (%s)", room["code"], card["seq"], card["title"])
+                await expire_due_shares()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -543,6 +681,69 @@ async def unack_card(join_code: str, card_id: int):
         return {"card_id": card_id, "group_id": group["id"], "acked": False}
 
 
+# ---------------------------------------------------------------- REST：观察席分享
+
+class ShareIn(BaseModel):
+    group_ids: list[int] = Field(min_length=1, max_length=3)  # 1～3 个参与组
+    minutes: int = Field(ge=5, le=120)                        # 有效期 5～120 分钟
+
+
+@app.post("/api/rooms/{code}/shares", status_code=201)
+async def create_share(code: str, body: ShareIn):
+    """主持人创建限时观察分享：随机凭证 + 到期时刻，落库持久化、可随时撤销。"""
+    async with state_lock:
+        room = get_room_or_404(code)
+        group_ids = list(dict.fromkeys(body.group_ids))  # 去重保序
+        if not group_ids:
+            raise HTTPException(status_code=400, detail="select at least one group")
+        for gid in group_ids:
+            get_group_or_404(room["id"], gid)  # 每个目标组都必须属于本房间
+        token = secrets.token_urlsafe(16)  # 128 位随机观察凭证，不可枚举
+        db.execute(
+            "INSERT INTO observer_shares (room_id, token, group_ids, expires_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (room["id"], token, json.dumps(group_ids), time.time() + body.minutes * 60, time.time()),
+        )
+        db.commit()
+        share = db.execute("SELECT * FROM observer_shares WHERE token = ?", (token,)).fetchone()
+        payload = share_public(share)
+        await publish(room["code"], room["id"], "share_created", payload)
+        return payload
+
+
+@app.delete("/api/rooms/{code}/shares/{token}")
+async def revoke_share(code: str, token: str):
+    """撤销观察分享（幂等）：凭证即刻失效，该凭证的在线观察者立即被断开。"""
+    async with state_lock:
+        room = get_room_or_404(code)
+        share = db.execute(
+            "SELECT * FROM observer_shares WHERE token = ? AND room_id = ?",
+            (token, room["id"]),
+        ).fetchone()
+        if share is None:
+            raise HTTPException(status_code=404, detail="share not found")
+        if not share["revoked"]:
+            db.execute("UPDATE observer_shares SET revoked = 1 WHERE id = ?", (share["id"],))
+            db.commit()
+            await publish(room["code"], room["id"], "share_revoked", {"token": token})
+        await hub.close_observer(room["code"], token,
+                                 {"kind": "error", "message": "观察链接已被主持人撤销"})
+        return {"ok": True, "token": token, "status": "revoked"}
+
+
+@app.get("/api/observe/{token}")
+async def observe_snapshot(token: str):
+    """观察者入口：凭有效观察凭证换取只读快照。
+
+    快照只含已揭示的全员卡片与所选组卡片；不含房间码、组加入码、
+    未揭示卡片与回执明细。凭证撤销或到期后一律 410，刷新重连不可恢复。
+    """
+    async with state_lock:
+        share = get_active_share_or_410(token)
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (share["room_id"],)).fetchone()
+        return build_snapshot(room, observer_scope_from(share))
+
+
 # ---------------------------------------------------------------- REST：时钟控制
 
 async def _clock_action(code: str, expect: tuple[str, ...], action: str, sql: str, params: tuple):
@@ -641,6 +842,37 @@ async def room_ws(websocket: WebSocket, code: str, last_event_id: int = 0):
     try:
         while True:
             await websocket.receive_text()  # 客户端无需上行；仅用于感知断线
+    except WebSocketDisconnect:
+        pass
+    finally:
+        hub.discard(hub_key, websocket)
+
+
+@app.websocket("/ws/observe/{token}")
+async def observe_ws(websocket: WebSocket, token: str, last_event_id: int = 0):
+    """观察者实时通道：与参与者同一套「先快照后增量」协议，事件按观察视野过滤。
+
+    凭证失效（撤销/到期）时拒绝接入；在线连接由撤销/到期路径主动断开（4403）。
+    """
+    await websocket.accept()
+    async with state_lock:
+        share = db.execute(
+            "SELECT * FROM observer_shares WHERE token = ?", (token,)
+        ).fetchone()
+        if share is None or not share_active(share):
+            await websocket.send_json({"kind": "error", "message": "观察链接已失效或已被撤销"})
+            await websocket.close(code=4403)
+            return
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (share["room_id"],)).fetchone()
+        scope = observer_scope_from(share)
+        hub_key = room["code"]
+        hub.add(hub_key, websocket, scope)
+        snapshot = build_snapshot(room, scope)
+        snapshot["last_event_id"] = max(snapshot["last_event_id"], last_event_id)
+        await websocket.send_json(snapshot)
+    try:
+        while True:
+            await websocket.receive_text()  # 观察者只读，无上行；仅用于感知断线
     except WebSocketDisconnect:
         pass
     finally:

@@ -7,20 +7,25 @@
  * 2. 服务端先推权威快照（snapshot）——全量替换本地状态，水位 = snapshot.last_event_id；
  * 3. 之后只应用 id > 水位的增量事件，旧事件一律丢弃，状态绝不回退。
  *
- * 分组定向：主持人用房间码连接（全量视野），参与者用组加入码连接；
- * 服务端已按组过滤快照与事件，未命中本组的卡片不会到达本端。
+ * 三种角色：
+ * - 主持人：房间码连接（全量视野，含观察分享管理）；
+ * - 参与者：组加入码连接（服务端按组过滤快照与事件）；
+ * - 观察者：限时观察链接（#/observe/{token}）进入，只读——只能看到已揭示的
+ *   全员卡片与分享所选组卡片，拿不到房间码、组加入码、未揭示卡片与回执明细；
+ *   链接到期或被撤销时服务端主动断开，重连也会被拒绝。
  */
 
 const $ = (sel) => document.querySelector(sel);
 
 const state = {
-  code: null,      // 主持人 = 房间码；参与者 = 组加入码
-  role: null,      // 'host' | 'player'
+  code: null,      // 主持人 = 房间码；参与者 = 组加入码；观察者 = 观察凭证
+  role: null,      // 'host' | 'player' | 'observer'
   roomName: '',
   status: 'idle',
   cards: [],
-  groups: [],      // 主持人：全部参与组；参与者：仅本组
-  groupId: null,   // 参与者本组 id（主持人为 null）
+  groups: [],      // 主持人：全部参与组；参与者：仅本组；观察者：分享所选组
+  shares: [],      // 主持人：全部观察分享（有效/失效）
+  groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   lastEventId: 0,
   clock: { status: 'idle', elapsedMs: 0, syncedAt: performance.now() },
   ws: null,
@@ -40,7 +45,10 @@ function showRoom() {
   $('#view-landing').classList.add('hidden');
   $('#view-room').classList.remove('hidden');
   $('#host-console').classList.toggle('hidden', state.role !== 'host');
-  $('#cards-title').textContent = state.role === 'host' ? '注入卡片（全部）' : '已揭示的情景注入';
+  $('#cards-title').textContent =
+    state.role === 'host' ? '注入卡片（全部）'
+    : state.role === 'observer' ? '已揭示的情景注入（观察席 · 只读）'
+    : '已揭示的情景注入';
 }
 
 /* ---------------------------------------------------------- 渲染 */
@@ -60,6 +68,8 @@ function groupName(id) {
 
 function renderMeta() {
   $('#room-name').textContent = state.roomName || '未命名演练';
+  // 观察者的 code 是观察凭证而非房间码，不显示「加入码」行
+  $('.room-code').classList.toggle('hidden', state.role === 'observer');
   $('#room-code').textContent = state.code;
   const st = $('#status');
   st.textContent = STATUS_TEXT[state.status] || state.status;
@@ -67,6 +77,10 @@ function renderMeta() {
   const pg = $('#player-group');
   if (state.role === 'player' && state.groupId != null) {
     pg.textContent = `参与组：${groupName(state.groupId)}`;
+    pg.classList.remove('hidden');
+  } else if (state.role === 'observer') {
+    const names = state.groups.map((g) => g.name).join('、');
+    pg.textContent = `观察席（只读）· 可见组：${names || '全员'}`;
     pg.classList.remove('hidden');
   } else {
     pg.classList.add('hidden');
@@ -153,6 +167,24 @@ function renderGroups() {
     sel.appendChild(opt);
   }
   sel.value = [...sel.options].some((o) => o.value === cur) ? cur : '';
+
+  // 观察分享表单的组复选框（1～3 个）；尽量保留已勾选项
+  const checked = new Set(
+    [...document.querySelectorAll('#share-groups input:checked')].map((el) => el.value)
+  );
+  const sg = $('#share-groups');
+  sg.innerHTML = '';
+  for (const g of state.groups) {
+    const label = document.createElement('label');
+    label.className = 'share-group-chip';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = String(g.id);
+    cb.checked = checked.has(String(g.id));
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(g.name));
+    sg.appendChild(label);
+  }
 }
 
 function sortedCards() {
@@ -165,10 +197,10 @@ function renderCards() {
   const all = sortedCards();
   const visible = state.role === 'host' ? all : all.filter((c) => c.revealed);
   $('#cards-empty').classList.toggle('hidden', visible.length > 0);
-  if (state.role === 'player') {
-    $('#cards-empty').textContent = all.some((c) => c.revealed) ? '' : '等待主持人注入情景…';
-  } else {
+  if (state.role === 'host') {
     $('#cards-empty').textContent = '暂无卡片，请在上方添加';
+  } else {
+    $('#cards-empty').textContent = all.some((c) => c.revealed) ? '' : '等待主持人注入情景…';
   }
   for (const card of visible) {
     const li = document.createElement('li');
@@ -269,9 +301,120 @@ function receiptSummary(card) {
   return box;
 }
 
+/* ---------------------------------------------------------- 观察席分享 */
+
+const SHARE_STATUS_TEXT = { active: '有效', expired: '已过期', revoked: '已撤销' };
+
+function shareStatus(s) {
+  if (s.status === 'revoked') return 'revoked';
+  return s.expires_at * 1000 > Date.now() ? 'active' : 'expired';
+}
+
+function shareUrl(s) {
+  return `${location.origin}/#/observe/${s.token}`;
+}
+
+function upsertShare(s) {
+  const i = state.shares.findIndex((x) => x.token === s.token);
+  if (i >= 0) state.shares[i] = s;
+  else state.shares.unshift(s); // 服务端按 id DESC 下发，新分享排最前
+}
+
+/* 主持人：分享列表（有效/失效），可复制链接、可撤销 */
+function renderShares() {
+  if (state.role !== 'host') return;
+  const list = $('#share-list');
+  list.innerHTML = '';
+  $('#shares-empty').classList.toggle('hidden', state.shares.length > 0);
+  for (const s of state.shares) {
+    const st = shareStatus(s);
+    const li = document.createElement('li');
+    li.className = 'share-item';
+
+    const main = document.createElement('div');
+    main.className = 'share-main';
+
+    const status = document.createElement('span');
+    status.className = `badge share-status-${st}`;
+    status.textContent = SHARE_STATUS_TEXT[st];
+    main.appendChild(status);
+
+    const groups = document.createElement('span');
+    groups.className = 'share-groups-label';
+    groups.textContent = (s.group_names || []).join('、');
+    main.appendChild(groups);
+
+    const mins = document.createElement('span');
+    mins.className = 'share-remaining';
+    mins.textContent = `${s.minutes} 分钟`;
+    main.appendChild(mins);
+
+    if (st === 'active') {
+      const remain = document.createElement('span');
+      remain.className = 'share-remaining';
+      remain.dataset.expiresAt = s.expires_at;
+      remain.dataset.token = s.token;
+      remain.textContent = remainingText(s.expires_at);
+      main.appendChild(remain);
+    }
+    li.appendChild(main);
+
+    const ops = document.createElement('span');
+    ops.className = 'share-ops';
+
+    const copy = document.createElement('button');
+    copy.className = 'group-op';
+    copy.textContent = '复制链接';
+    copy.onclick = () => {
+      navigator.clipboard?.writeText(shareUrl(s));
+      copy.textContent = '已复制';
+      setTimeout(() => { copy.textContent = '复制链接'; }, 1200);
+    };
+    ops.appendChild(copy);
+
+    if (st === 'active') {
+      const revoke = document.createElement('button');
+      revoke.className = 'group-op group-del';
+      revoke.textContent = '撤销';
+      revoke.onclick = async () => {
+        if (!confirm('撤销该观察链接？在线观察者将立即断线，链接此后永久失效。')) return;
+        try {
+          await api('DELETE', `/api/rooms/${state.code}/shares/${s.token}`);
+        } catch (err) { showError(err); }
+      };
+      ops.appendChild(revoke);
+    }
+    li.appendChild(ops);
+    list.appendChild(li);
+  }
+}
+
+function remainingText(expiresAt) {
+  const mins = Math.ceil((expiresAt * 1000 - Date.now()) / 60000);
+  return mins > 1 ? `剩余 ${mins} 分钟` : '剩余不足 1 分钟';
+}
+
+/* 倒计时文本就地更新（不重建列表，避免打断点击）；到期翻转时整体重渲染 */
+function updateShareCountdowns() {
+  let flip = false;
+  for (const el of document.querySelectorAll('.share-remaining[data-expires-at]')) {
+    const s = state.shares.find((x) => x.token === el.dataset.token);
+    if (!s || s.status !== 'active') continue;
+    const exp = parseFloat(el.dataset.expiresAt);
+    if (exp * 1000 <= Date.now()) {
+      s.status = 'expired';
+      flip = true;
+    } else {
+      el.textContent = remainingText(exp);
+    }
+  }
+  if (flip) renderShares();
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
+  renderShares();
   renderCards();
 }
 
@@ -281,6 +424,7 @@ setInterval(() => {
   const c = state.clock;
   const elapsed = c.status === 'running' ? c.elapsedMs + (performance.now() - c.syncedAt) : c.elapsedMs;
   $('#clock').textContent = fmt(elapsed);
+  if (state.role === 'host') updateShareCountdowns();
 }, 200);
 
 function syncClock(status, elapsedMs) {
@@ -294,6 +438,7 @@ function applySnapshot(msg) {
   state.roomName = msg.room.name;
   state.cards = msg.cards;
   state.groups = msg.groups || [];
+  state.shares = msg.shares || []; // 仅主持人快照携带
   state.groupId = msg.scope && msg.scope.role === 'player' ? msg.scope.group_id : null;
   state.lastEventId = msg.last_event_id; // 权威水位
   syncClock(msg.room.status, msg.room.elapsed_ms);
@@ -356,6 +501,15 @@ function applyEvent(msg) {
         }
       });
       break;
+    case 'share_created':
+      upsertShare(p); // 仅主持人会收到（事件含观察凭证，服务端已过滤）
+      break;
+    case 'share_revoked':
+    case 'share_expired': {
+      const s = state.shares.find((x) => x.token === p.token);
+      if (s) s.status = msg.type === 'share_revoked' ? 'revoked' : 'expired';
+      break;
+    }
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
@@ -372,14 +526,15 @@ function applyEvent(msg) {
   renderAll();
 }
 
-/* 事件流里新增的卡片不带回执字段（新卡/新揭示必然零回执），按角色补默认值 */
+/* 事件流里新增的卡片不带回执字段（新卡/新揭示必然零回执），按角色补默认值；
+   观察者只读，不附加任何回执状态 */
 function initReceiptState(card) {
   if (state.role === 'host') {
     card.receipts = {
       expected: card.group_id == null ? state.groups.map((g) => g.id) : [card.group_id],
       acked: [],
     };
-  } else {
+  } else if (state.role === 'player') {
     card.my_receipt = false;
   }
 }
@@ -394,7 +549,8 @@ function setConn(up) {
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/${state.code}?last_event_id=${state.lastEventId}`);
+  const path = state.role === 'observer' ? `/ws/observe/${state.code}` : `/ws/${state.code}`;
+  const ws = new WebSocket(`${proto}://${location.host}${path}?last_event_id=${state.lastEventId}`);
   state.ws = ws;
 
   ws.onopen = () => { state.reconnectDelay = 1000; setConn(true); };
@@ -443,9 +599,25 @@ function enterRoom(code, role) {
   state.lastEventId = 0;
   state.cards = [];
   state.groups = [];
+  state.shares = [];
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
   localStorage.setItem(`inject-role-${code}`, role);
+  showRoom();
+  renderAll();
+  connect();
+}
+
+/* 观察者：凭限时观察链接进入（只读视野，凭证失效后服务端拒绝重连） */
+function enterObserver(token) {
+  state.code = token;
+  state.role = 'observer';
+  state.lastEventId = 0;
+  state.cards = [];
+  state.groups = [];
+  state.shares = [];
+  state.groupId = null;
+  location.hash = `#/observe/${token}`;
   showRoom();
   renderAll();
   connect();
@@ -514,9 +686,35 @@ $('#card-form').onsubmit = async (e) => {
   } catch (err) { showError(err); }
 };
 
-/* 刷新恢复：根据 hash 与本地角色记录重进房间（走完整的快照+增量协议） */
+$('#share-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const ids = [...document.querySelectorAll('#share-groups input:checked')]
+    .map((el) => parseInt(el.value, 10));
+  const minutes = parseInt($('#share-minutes').value, 10);
+  if (ids.length < 1 || ids.length > 3) {
+    showError(new Error('请选择 1～3 个参与组'));
+    return;
+  }
+  if (!Number.isInteger(minutes) || minutes < 5 || minutes > 120) {
+    showError(new Error('有效期须为 5～120 分钟'));
+    return;
+  }
+  try {
+    const share = await api('POST', `/api/rooms/${state.code}/shares`,
+      { group_ids: ids, minutes });
+    upsertShare(share); // share_created 事件到达时按 token 去重
+    renderShares();
+    document.querySelectorAll('#share-groups input:checked').forEach((el) => { el.checked = false; });
+    $('#share-minutes').value = 30;
+  } catch (err) { showError(err); }
+};
+
+/* 刷新恢复：根据 hash 与本地角色记录重进房间（走完整的快照+增量协议）；
+   观察链接同样从 hash 恢复——凭证已失效时服务端会拒绝并提示 */
 (function boot() {
   const m = location.hash.match(/^#\/(host|player)\/([A-Z0-9]{6})$/);
-  if (m) enterRoom(m[2], m[1]);
-  else showLanding();
+  if (m) { enterRoom(m[2], m[1]); return; }
+  const mo = location.hash.match(/^#\/observe\/([A-Za-z0-9_-]+)$/);
+  if (mo) { enterObserver(mo[1]); return; }
+  showLanding();
 })();

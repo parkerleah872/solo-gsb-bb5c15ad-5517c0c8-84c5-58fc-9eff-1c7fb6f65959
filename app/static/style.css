@@ -173,6 +173,45 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .badge-all    { background: rgba(77, 163, 255, .15); color: var(--accent); }
 .badge-target { background: rgba(245, 185, 66, .15); color: var(--amber); }
 
+/* 观察席分享 */
+.share-groups { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.share-group-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+.share-group-chip:has(input:checked) { border-color: var(--accent); color: var(--accent); }
+.share-group-chip input { width: auto; margin: 0; }
+.share-form-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }
+.share-form-row input { margin-bottom: 0; }
+.share-list { list-style: none; margin: 10px 0 0; padding: 0; }
+.share-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+.share-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.share-groups-label { font-weight: 700; }
+.share-remaining { color: var(--muted); font-size: 12px; }
+.share-ops { display: flex; gap: 4px; }
+.share-status-active  { background: rgba(62, 207, 142, .15); color: var(--green); }
+.share-status-expired { background: rgba(139, 150, 173, .15); color: var(--muted); }
+.share-status-revoked { background: rgba(239, 91, 107, .15); color: var(--red); }
+
 /* 卡片回执 */
 .receipt-btn {
   background: transparent;

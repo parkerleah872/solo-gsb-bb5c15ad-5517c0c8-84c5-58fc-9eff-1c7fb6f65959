@@ -62,6 +62,20 @@
         <button type="submit" class="primary">创建参与组</button>
       </form>
 
+      <h3>观察席分享</h3>
+      <p class="hint">选择 1～3 个参与组并设置 5～120 分钟有效期，生成限时只读观察链接：观察者只能看到
+        <strong>已揭示</strong>的全员卡片与所选组卡片，看不到房间码、组加入码、未揭示卡片与回执明细，
+        也没有任何操作能力。链接可随时撤销，到期或撤销后观察者立即断线且无法恢复。</p>
+      <form id="share-form">
+        <div id="share-groups" class="share-groups"></div>
+        <div class="share-form-row">
+          <input id="share-minutes" type="number" min="5" max="120" step="1" value="30" required title="有效期（分钟，5～120）">
+          <button type="submit" class="primary">生成观察链接</button>
+        </div>
+      </form>
+      <p id="shares-empty" class="hint">暂无观察分享</p>
+      <ul id="share-list" class="share-list"></ul>
+
       <h3>添加注入卡片</h3>
       <form id="card-form">
         <div class="form-row">

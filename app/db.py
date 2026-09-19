@@ -63,12 +63,24 @@ CREATE TABLE IF NOT EXISTS receipts (
     UNIQUE (card_id, group_id)                        -- 同一参与组对同一卡片仅保留一条回执
 );
 
+CREATE TABLE IF NOT EXISTS observer_shares (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id          INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    token            TEXT NOT NULL UNIQUE,          -- 随机观察凭证（URL 安全，不可猜）
+    group_ids        TEXT NOT NULL,                 -- JSON 数组：1~3 个参与组 id
+    expires_at       REAL NOT NULL,                 -- 墙钟到期时刻（秒），到期即失效
+    revoked          INTEGER NOT NULL DEFAULT 0,    -- 主持人撤销标记，撤销即失效
+    expired_notified INTEGER NOT NULL DEFAULT 0,    -- ticker 是否已广播到期并断开连接
+    created_at       REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_groups_room ON groups(room_id);
 CREATE INDEX IF NOT EXISTS idx_events_room ON events(room_id, id);
 CREATE INDEX IF NOT EXISTS idx_receipts_room ON receipts(room_id, card_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_group ON receipts(group_id);
+CREATE INDEX IF NOT EXISTS idx_observer_shares_room ON observer_shares(room_id);
 """
 
 
