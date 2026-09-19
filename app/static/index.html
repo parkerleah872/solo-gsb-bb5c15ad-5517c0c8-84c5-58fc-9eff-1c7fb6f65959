@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>情景注入台 · 桌面事故演练</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>情景注入台</h1>
+    <span id="conn" class="conn conn-down">未连接</span>
+  </header>
+
+  <!-- 入口：创建 / 加入 -->
+  <main id="view-landing" class="landing">
+    <section class="panel">
+      <h2>主持演练</h2>
+      <p class="hint">创建演练房间，编排注入卡片并控制虚拟时钟。</p>
+      <input id="create-name" type="text" placeholder="演练名称，如：核心库故障桌面演练" maxlength="120">
+      <button id="btn-create" class="primary">创建演练</button>
+    </section>
+    <section class="panel">
+      <h2>参与演练</h2>
+      <p class="hint">输入主持人分享的 6 位组加入码，实时接收本组的情景注入。</p>
+      <input id="join-code" type="text" placeholder="组加入码" maxlength="6" autocomplete="off">
+      <button id="btn-join" class="primary">加入演练</button>
+      <p id="landing-error" class="error"></p>
+    </section>
+  </main>
+
+  <!-- 房间视图 -->
+  <main id="view-room" class="room hidden">
+    <section class="room-head panel">
+      <div>
+        <div class="room-name" id="room-name"></div>
+        <div class="room-code">加入码 <button id="room-code" class="code-chip" title="点击复制"></button></div>
+        <div id="player-group" class="player-group hidden"></div>
+      </div>
+      <div class="clock-box">
+        <div id="clock" class="clock">00:00:00</div>
+        <div id="status" class="status">待机</div>
+      </div>
+    </section>
+    <p id="room-error" class="error"></p>
+
+    <!-- 主持人控制台 -->
+    <section id="host-console" class="panel hidden">
+      <h2>控制台</h2>
+      <div class="controls">
+        <button id="btn-start"  class="primary">开始演练</button>
+        <button id="btn-pause"  class="warn">暂停</button>
+        <button id="btn-resume" class="primary">继续</button>
+        <button id="btn-reset"  class="danger">重置</button>
+      </div>
+
+      <h3>参与组（<span id="group-count">0</span>/8）</h3>
+      <p class="hint">每组一个加入码；参与者凭码进入后只能看到「全员」卡片与目标为本组的卡片。</p>
+      <ul id="group-list" class="group-list"></ul>
+      <form id="group-form" class="group-form">
+        <input id="group-name" type="text" placeholder="新组名称，如：红队" maxlength="60" required>
+        <button type="submit" class="primary">创建参与组</button>
+      </form>
+
+      <h3>添加注入卡片</h3>
+      <form id="card-form">
+        <div class="form-row">
+          <input id="card-title" type="text" placeholder="卡片标题，如：告警风暴出现" required maxlength="200">
+          <input id="card-trigger" type="number" min="0" max="86400" step="1" placeholder="触发秒数" required title="相对演练开始的秒数">
+        </div>
+        <select id="card-target" title="卡片目标：全员或某个参与组">
+          <option value="">全员</option>
+        </select>
+        <textarea id="card-content" rows="2" placeholder="注入内容 / 情景描述（参与者可见）" maxlength="4000"></textarea>
+        <button type="submit" class="primary">添加卡片</button>
+        <span id="card-form-hint" class="hint"></span>
+      </form>
+    </section>
+
+    <!-- 卡片列表 -->
+    <section class="panel">
+      <h2 id="cards-title">注入卡片</h2>
+      <p id="cards-empty" class="hint">暂无卡片</p>
+      <ul id="card-list" class="card-list"></ul>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

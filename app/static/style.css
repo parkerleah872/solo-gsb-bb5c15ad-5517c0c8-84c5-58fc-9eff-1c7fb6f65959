@@ -1,0 +1,207 @@
+:root {
+  --bg: #0f1420;
+  --panel: #1a2233;
+  --panel-2: #222c42;
+  --text: #e6ebf5;
+  --muted: #8b96ad;
+  --accent: #4da3ff;
+  --green: #3ecf8e;
+  --amber: #f5b942;
+  --red: #ef5b6b;
+  --border: #2c3852;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.topbar h1 { font-size: 18px; margin: 0; letter-spacing: 2px; }
+
+.conn { font-size: 12px; padding: 3px 10px; border-radius: 999px; }
+.conn-up   { background: rgba(62, 207, 142, .15); color: var(--green); }
+.conn-down { background: rgba(239, 91, 107, .15); color: var(--red); }
+
+main { max-width: 880px; margin: 24px auto; padding: 0 16px; }
+.hidden { display: none !important; }
+
+.landing { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 700px) { .landing { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 16px;
+}
+.panel h2 { margin: 0 0 8px; font-size: 16px; }
+.panel h3 { margin: 16px 0 8px; font-size: 14px; color: var(--muted); }
+.hint { color: var(--muted); font-size: 13px; margin: 4px 0 12px; }
+.error { color: var(--red); font-size: 13px; min-height: 18px; }
+
+input, textarea, select {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 14px;
+  margin-bottom: 10px;
+  font-family: inherit;
+}
+input:focus, textarea:focus, select:focus { outline: 1px solid var(--accent); }
+select { appearance: auto; }
+
+button {
+  border: none;
+  border-radius: 6px;
+  padding: 10px 18px;
+  font-size: 14px;
+  cursor: pointer;
+  color: #0b1020;
+  font-weight: 600;
+}
+button:disabled { opacity: .35; cursor: not-allowed; }
+.primary { background: var(--accent); }
+.warn    { background: var(--amber); }
+.danger  { background: var(--red); color: #fff; }
+
+/* 房间视图 */
+.room-head { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+.room-name { font-size: 18px; font-weight: 700; }
+.room-code { color: var(--muted); font-size: 13px; margin-top: 6px; }
+.code-chip {
+  background: var(--panel-2);
+  color: var(--accent);
+  border: 1px solid var(--border);
+  font-family: ui-monospace, monospace;
+  font-size: 15px;
+  letter-spacing: 3px;
+  padding: 4px 12px;
+}
+.clock-box { text-align: right; }
+.clock {
+  font-family: ui-monospace, monospace;
+  font-size: 42px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.status { margin-top: 6px; font-size: 13px; color: var(--muted); }
+.status.running { color: var(--green); }
+.status.paused  { color: var(--amber); }
+
+.controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.form-row { display: grid; grid-template-columns: 1fr 140px; gap: 10px; }
+
+.card-list { list-style: none; margin: 0; padding: 0; }
+.card-item {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--muted);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.card-item.revealed { border-left-color: var(--green); }
+.card-item.pending  { opacity: .75; }
+.card-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.card-trigger { font-family: ui-monospace, monospace; color: var(--accent); }
+.badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; }
+.badge-revealed { background: rgba(62, 207, 142, .15); color: var(--green); }
+.badge-pending  { background: rgba(139, 150, 173, .15); color: var(--muted); }
+.card-title { font-weight: 700; margin-bottom: 4px; }
+.card-content { font-size: 14px; color: var(--text); white-space: pre-wrap; }
+.card-del {
+  background: transparent;
+  color: var(--red);
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+/* 参与组管理 */
+.group-list { list-style: none; margin: 0 0 10px; padding: 0; }
+.group-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+.group-name { font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.group-code { font-size: 13px; letter-spacing: 2px; padding: 3px 10px; }
+.group-op {
+  background: transparent;
+  color: var(--accent);
+  padding: 2px 6px;
+  font-size: 12px;
+  font-weight: 400;
+}
+.group-op.group-del { color: var(--red); }
+.group-form { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: start; }
+.group-form input { margin-bottom: 0; }
+
+.player-group { color: var(--amber); font-size: 13px; margin-top: 6px; }
+
+.badge-all    { background: rgba(77, 163, 255, .15); color: var(--accent); }
+.badge-target { background: rgba(245, 185, 66, .15); color: var(--amber); }
+
+/* 卡片回执 */
+.receipt-btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-left: 8px;
+}
+.receipt-btn.acked {
+  background: rgba(62, 207, 142, .15);
+  border-color: var(--green);
+  color: var(--green);
+}
+.receipt-btn:disabled { opacity: .5; }
+
+.receipt-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  font-size: 12px;
+}
+.receipt-count { color: var(--muted); font-weight: 700; margin-right: 4px; }
+.receipt-count.done { color: var(--green); }
+.receipt-chip { padding: 2px 8px; border-radius: 999px; font-size: 11px; }
+.receipt-ok   { background: rgba(62, 207, 142, .15); color: var(--green); }
+.receipt-wait { background: rgba(139, 150, 173, .15); color: var(--muted); }

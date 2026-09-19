@@ -1,0 +1,14 @@
+services:
+  inject:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/inject.db
+      TICK_INTERVAL: "0.25"
+    volumes:
+      - inject-data:/data
+    restart: unless-stopped
+
+volumes:
+  inject-data:
